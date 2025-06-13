@@ -9,7 +9,7 @@ from transformers import SiglipProcessor, SiglipModel
 
 # ---------------- CONFIG ----------------------------------
 TEST_DIR     = "/home/jayant/Desh4/pasted_Test"
-CKPT_PATTERN = "/home/jayant/Desh4/finetune_siglip/siglip_desh_finetune_*.pth"
+CKPT_PATTERN = "/home/jayant/Desh4/finetune_siglip/siglip_desh_finetune_5.pth"
 MODEL_ID     = "google/siglip2-base-patch16-384"
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE   = 4
@@ -19,10 +19,9 @@ os.makedirs(MISCLS_ROOT, exist_ok=True)
 
 # ---------------- Processor -------------------------------
 processor = SiglipProcessor.from_pretrained(MODEL_ID)
-image_mean = processor.image_mean
-image_std  = processor.image_std
-image_size = processor.size['height']
-
+image_mean = processor.image_processor.image_mean
+image_std  = processor.image_processor.image_std
+image_size = processor.image_processor.size["height"]
 # ---------------- Dataset ---------------------------------
 from torchvision import transforms
 
@@ -38,26 +37,42 @@ file_paths = [p for p, _ in test_ds.samples]
 
 # ---------------- Model Definition ------------------------
 class SigLIPClassifier(nn.Module):
-    def __init__(self, base: SiglipModel, num_classes=2):
+    def __init__(self, model: SiglipModel, num_classes=2, n_train_blocks=3):
         super().__init__()
-        self.vision_model = base.vision_model
+        self.vision_model = model.vision_model
         self.hidden_size = self.vision_model.config.hidden_size
         self.transformer = self.vision_model.encoder
-        self.vision_model.encoder.layers = self.vision_model.encoder.layers[:-1]
-        self.bilinear = nn.Bilinear(self.hidden_size, self.hidden_size, self.hidden_size)
+
+        # Drop final transformer block
+        self.transformer.layers = self.transformer.layers[:-1]
+
+        # Freeze all parameters
+        for param in self.vision_model.parameters():
+            param.requires_grad = False
+
+        # Unfreeze last n transformer blocks
+        for blk in self.transformer.layers[-n_train_blocks:]:
+            for param in blk.parameters():
+                param.requires_grad = True
+
+        self.bilinear   = nn.Bilinear(self.hidden_size, self.hidden_size, self.hidden_size)
         self.classifier = nn.Linear(self.hidden_size, num_classes)
 
     def forward(self, pixel_values):
-        embedding = self.vision_model.embeddings(pixel_values)
-        attention_mask = torch.ones(
-            (embedding.shape[0], embedding.shape[1]),
-            dtype=torch.bool, device=embedding.device
-        )
+        # Step 1: get embeddings
+        x = self.vision_model.embeddings(pixel_values)
+
+        # Step 2: attention mask: [B, S] → [B, 1, 1, S]
+        batch_size, seq_len, _ = x.shape
+        attention_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=pixel_values.device)
+        attention_mask = attention_mask[:, None, None, :]  # shape: [B, 1, 1, S]
+
         cls_tokens = []
         for i, blk in enumerate(self.transformer.layers):
-            embedding = blk(embedding, attention_mask=attention_mask)[0]
-            if i in [len(self.transformer.layers)-3, len(self.transformer.layers)-2]:
-                cls_tokens.append(embedding[:, 0])
+            x = blk(x, attention_mask=attention_mask)[0]
+            if i in [len(self.transformer.layers) - 3, len(self.transformer.layers) - 2]:
+                cls_tokens.append(x[:, 0])  # CLS token
+
         pooled = self.bilinear(*cls_tokens)
         pooled = self.vision_model.post_layernorm(pooled)
         return self.classifier(pooled)
